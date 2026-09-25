@@ -2,7 +2,7 @@
 # Ожидает requirements.txt, requirements-dev.txt, пакет shop,
 # tests/{unit,integration,api,e2e}, ci/check_coverage.py,
 # ops/{deploy,smoke}.sh и perf/shop.js. Секреты и URL задаются в GitLab CI variables.
-# В requirements-dev.txt нужны: pytest, pytest-cov, coverage, diff-cover,
+# В requirements-dev.txt нужны: pytest, pytest-cov, pytest-split, coverage, diff-cover,
 # ruff, mypy, build, pip-audit и зависимости тестов.
 
 workflow:
@@ -88,6 +88,7 @@ dependency_scan:
 
 integration:
   stage: full
+  parallel: 5
   needs:
     - job: build
       artifacts: true
@@ -101,18 +102,19 @@ integration:
     DATABASE_URL: postgresql://shop:shop_ci_only@db:5432/shop_test
   script:
     - mkdir -p reports
-    - pytest tests/integration -q --cov=shop --cov-branch --cov-report=xml:reports/coverage-integration.xml --junitxml=reports/integration.xml
-    - mv .coverage reports/.coverage.integration
+    - pytest tests/integration -q --splits "$CI_NODE_TOTAL" --group "$CI_NODE_INDEX" --splitting-algorithm least_duration --cov=shop --cov-branch --cov-report=xml:reports/coverage-integration-$CI_NODE_INDEX.xml --junitxml=reports/integration-$CI_NODE_INDEX.xml
+    - mv .coverage "reports/.coverage.integration.$CI_NODE_INDEX"
   artifacts:
     when: always
     reports:
-      junit: reports/integration.xml
+      junit: reports/integration-*.xml
     paths:
       - reports/
     expire_in: 30 days
 
 api:
   stage: full
+  parallel: 4
   needs:
     - job: build
       artifacts: true
@@ -126,12 +128,12 @@ api:
     DATABASE_URL: postgresql://shop:shop_ci_only@db:5432/shop_test
   script:
     - mkdir -p reports
-    - pytest tests/api -q --cov=shop --cov-branch --cov-report=xml:reports/coverage-api.xml --junitxml=reports/api.xml
-    - mv .coverage reports/.coverage.api
+    - pytest tests/api -q --splits "$CI_NODE_TOTAL" --group "$CI_NODE_INDEX" --splitting-algorithm least_duration --cov=shop --cov-branch --cov-report=xml:reports/coverage-api-$CI_NODE_INDEX.xml --junitxml=reports/api-$CI_NODE_INDEX.xml
+    - mv .coverage "reports/.coverage.api.$CI_NODE_INDEX"
   artifacts:
     when: always
     reports:
-      junit: reports/api.xml
+      junit: reports/api-*.xml
     paths:
       - reports/
     expire_in: 30 days
@@ -166,6 +168,33 @@ coverage_gate:
       - reports/coverage.json
       - reports/coverage.xml
     expire_in: 30 days
+
+# Необязательный отдельный стенд для просмотра конкретного MR.
+# Нужен реальный ops/deploy.sh и низкопривилегированные секреты review-среды.
+deploy_mr_review:
+  stage: deploy
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  needs:
+    - job: build
+      artifacts: true
+    - job: lint
+      artifacts: false
+    - job: static_analysis
+      artifacts: false
+    - job: dependency_scan
+      artifacts: false
+    - job: coverage_gate
+      artifacts: false
+  script:
+    - sh ops/deploy.sh "review/$CI_MERGE_REQUEST_IID" "$CI_COMMIT_SHA" dist/*.whl
+  environment:
+    name: review/$CI_MERGE_REQUEST_IID
+    auto_stop_in: 1 day
+  resource_group: review/$CI_MERGE_REQUEST_IID
+  timeout: 30m
 
 deploy_test:
   extends: .main_only
@@ -276,6 +305,7 @@ deploy_prod:
       artifacts: true
   when: manual
   allow_failure: false
+  manual_confirmation: "Выпустить проверенный артефакт в production?"
   script:
     - sh ops/deploy.sh production "$CI_COMMIT_SHA" dist/*.whl
   environment:
