@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seminar4-shop-example"
+version = "0.1.0"
+description = "Small runnable shop example for seminar 4 CI"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
