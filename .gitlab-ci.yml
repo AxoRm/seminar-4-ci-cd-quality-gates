@@ -1,0 +1,283 @@
+# Учебный пример для Python/FastAPI backend интернет-магазина.
+# Ожидает requirements.txt, requirements-dev.txt, пакет shop,
+# tests/{unit,integration,api,e2e}, ci/check_coverage.py,
+# ops/{deploy,smoke}.sh и perf/shop.js. Секреты и URL задаются в GitLab CI variables.
+# В requirements-dev.txt нужны: pytest, pytest-cov, coverage, diff-cover,
+# ruff, mypy, build, pip-audit и зависимости тестов.
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+
+stages:
+  - fast
+  - full
+  - deploy
+  - verify
+  - release
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  GIT_DEPTH: "0"
+
+default:
+  image: python:3.12-slim
+  before_script:
+    - python -m pip install -r requirements-dev.txt
+    - python -m pip install -e .
+  cache:
+    key:
+      files:
+        - requirements.txt
+        - requirements-dev.txt
+    paths:
+      - .cache/pip
+
+.main_only:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+lint:
+  stage: fast
+  script:
+    - ruff check src tests
+
+static_analysis:
+  stage: fast
+  script:
+    - mypy src/shop
+
+build:
+  stage: fast
+  script:
+    - python -m build --wheel
+    - sha256sum dist/*.whl > dist/SHA256SUMS
+  artifacts:
+    when: always
+    paths:
+      - dist/
+    expire_in: 30 days
+
+unit:
+  stage: fast
+  script:
+    - mkdir -p reports
+    - pytest tests/unit -q --cov=shop --cov-branch --cov-report=xml:reports/coverage-unit.xml --junitxml=reports/unit.xml
+    - mv .coverage reports/.coverage.unit
+  artifacts:
+    when: always
+    reports:
+      junit: reports/unit.xml
+    paths:
+      - reports/
+    expire_in: 30 days
+
+dependency_scan:
+  stage: fast
+  script:
+    - mkdir -p reports
+    # Любая известная уязвимость в runtime dependencies даёт ненулевой exit code.
+    - pip-audit -r requirements.txt -f json -o reports/dependencies.json
+  artifacts:
+    when: always
+    paths:
+      - reports/
+    expire_in: 30 days
+
+integration:
+  stage: full
+  needs:
+    - job: build
+      artifacts: true
+  services:
+    - name: postgres:16
+      alias: db
+  variables:
+    POSTGRES_DB: shop_test
+    POSTGRES_USER: shop
+    POSTGRES_PASSWORD: shop_ci_only
+    DATABASE_URL: postgresql://shop:shop_ci_only@db:5432/shop_test
+  script:
+    - mkdir -p reports
+    - pytest tests/integration -q --cov=shop --cov-branch --cov-report=xml:reports/coverage-integration.xml --junitxml=reports/integration.xml
+    - mv .coverage reports/.coverage.integration
+  artifacts:
+    when: always
+    reports:
+      junit: reports/integration.xml
+    paths:
+      - reports/
+    expire_in: 30 days
+
+api:
+  stage: full
+  needs:
+    - job: build
+      artifacts: true
+  services:
+    - name: postgres:16
+      alias: db
+  variables:
+    POSTGRES_DB: shop_test
+    POSTGRES_USER: shop
+    POSTGRES_PASSWORD: shop_ci_only
+    DATABASE_URL: postgresql://shop:shop_ci_only@db:5432/shop_test
+  script:
+    - mkdir -p reports
+    - pytest tests/api -q --cov=shop --cov-branch --cov-report=xml:reports/coverage-api.xml --junitxml=reports/api.xml
+    - mv .coverage reports/.coverage.api
+  artifacts:
+    when: always
+    reports:
+      junit: reports/api.xml
+    paths:
+      - reports/
+    expire_in: 30 days
+
+coverage_gate:
+  stage: full
+  needs:
+    - job: unit
+      artifacts: true
+    - job: integration
+      artifacts: true
+    - job: api
+      artifacts: true
+  script:
+    - coverage combine reports
+    - coverage json -o reports/coverage.json
+    - coverage xml -o reports/coverage.xml
+    - python ci/check_coverage.py reports/coverage.json
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        apt-get update -qq && apt-get install -y -qq git >/dev/null
+        git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --depth=1
+        diff-cover reports/coverage.xml --compare-branch "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --fail-under=85
+      fi
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: reports/coverage.xml
+    paths:
+      - reports/coverage.json
+      - reports/coverage.xml
+    expire_in: 30 days
+
+deploy_test:
+  extends: .main_only
+  stage: deploy
+  needs:
+    - job: build
+      artifacts: true
+    - job: lint
+      artifacts: false
+    - job: static_analysis
+      artifacts: false
+    - job: dependency_scan
+      artifacts: false
+    - job: coverage_gate
+      artifacts: false
+  script:
+    - sh ops/deploy.sh test "$CI_COMMIT_SHA" dist/*.whl
+  environment:
+    name: test
+  resource_group: test
+
+deploy_perf:
+  extends: .main_only
+  stage: deploy
+  needs:
+    - job: build
+      artifacts: true
+    - job: lint
+      artifacts: false
+    - job: static_analysis
+      artifacts: false
+    - job: dependency_scan
+      artifacts: false
+    - job: coverage_gate
+      artifacts: false
+  script:
+    - sh ops/deploy.sh perf "$CI_COMMIT_SHA" dist/*.whl
+  environment:
+    name: perf
+  resource_group: perf
+
+smoke_test:
+  extends: .main_only
+  stage: verify
+  needs:
+    - job: deploy_test
+      artifacts: false
+  script:
+    - sh ops/smoke.sh "$TEST_BASE_URL"
+
+e2e:
+  extends: .main_only
+  stage: verify
+  needs:
+    - job: smoke_test
+      artifacts: false
+  script:
+    - mkdir -p reports
+    - pytest tests/e2e -q --junitxml=reports/e2e.xml
+  timeout: 90m
+  artifacts:
+    when: always
+    reports:
+      junit: reports/e2e.xml
+    paths:
+      - reports/
+    expire_in: 30 days
+
+load_test:
+  extends: .main_only
+  stage: verify
+  image:
+    name: grafana/k6:0.53.0
+    entrypoint: [""]
+  before_script: []
+  needs:
+    - job: deploy_perf
+      artifacts: false
+  script:
+    - mkdir -p reports
+    # Пороговые условия заданы в options.thresholds файла perf/shop.js.
+    - k6 run -e BASE_URL="$PERF_BASE_URL" --summary-export=reports/load-summary.json perf/shop.js
+  timeout: 3h
+  artifacts:
+    when: always
+    paths:
+      - reports/
+    expire_in: 30 days
+
+release_gate:
+  extends: .main_only
+  stage: release
+  needs:
+    - job: e2e
+      artifacts: false
+    - job: load_test
+      artifacts: false
+  script:
+    - echo "E2E и нагрузочные пороги пройдены для $CI_COMMIT_SHA"
+
+deploy_prod:
+  extends: .main_only
+  stage: release
+  needs:
+    - job: release_gate
+      artifacts: false
+    - job: build
+      artifacts: true
+  when: manual
+  allow_failure: false
+  script:
+    - sh ops/deploy.sh production "$CI_COMMIT_SHA" dist/*.whl
+  environment:
+    name: production
+  resource_group: production
