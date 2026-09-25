@@ -1,4 +1,4 @@
-"""Учебный quality gate для coverage.py JSON после объединения тестовых jobs."""
+"""quality gate для coverage.py JSON после объединения тестовых jobs."""
 
 from __future__ import annotations
 
